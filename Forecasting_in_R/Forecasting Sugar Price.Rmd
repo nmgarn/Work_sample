@@ -1,0 +1,517 @@
+---
+title: "Sugar Forecasting"
+Author: Nathan Garn
+date: "2023-04-15"
+output:
+  html_document:
+    highlight: breezedark
+    number_sections: yes
+    toc: yes
+    fig_width: 15
+    fig_height: 10
+  '': default
+---
+
+# Packages
+```{r packages}
+library(quantmod)
+library(ggplot2)
+library(forecast)
+library(astsa)
+library(tseries)
+library(tidyverse)
+library(caret)
+library(bigrquery)
+library(prophet)
+library(lubridate)
+library(openxlsx)
+library(dplyr)
+library(readr)
+library(feasts)
+library(tsibble)
+library(Metrics)
+library(rugarch)
+library(rmgarch)
+
+
+```
+
+# Data Load
+```{r}
+
+sugar <- read.csv("sugar-prices-historical-chart-data.csv",stringsAsFactors = FALSE)%>%
+mutate(date = mdy(date))%>% 
+mutate(month = format_ISO8601(date, precision = "ym"))
+
+```
+
+# Exploring Sugar
+```{r}
+
+# Looking at the price of sugar over the last 30 years
+ggplot(sugar, aes(date, price)) +
+  geom_line() +
+  labs(title = "Sugar Prices") + xlab("year") + ylab("prices")
+  
+#Summary of sugar
+summary(sugar)
+#Significant fluctuations in price.
+  
+#Sugar monthly average
+
+sugar_m <- sugar %>% group_by(month) %>% mutate(mon_avg = mean(price))%>%
+select(month, mon_avg)
+
+#Drop Duplicate rows Sugar
+
+sugar_m <- sugar_m[!duplicated(sugar_m),]
+
+#Creating Time series data for Sugar
+
+sugar_ts <- ts(sugar_m$mon_avg,start=c(1993),frequency=12)
+
+#Plotting
+
+chartSeries(sugar_ts)
+
+
+#Looking at trends
+
+autoplot(decompose((sugar_ts)),main="") 
+#Price spikes occur between 2010-2012 and again in the 2020's
+
+#Sugar Looking for daily or weekly trends
+
+sugar_r <- sugar %>%
+filter(date >= as.Date('2022-11-01') & date <= as.Date('2023-01-31'))
+
+
+ggplot(sugar_r, aes(date, price)) +
+  geom_line() +
+  labs(title = "Sugar Prices Daily") + xlab("time") + ylab("prices")
+
+# There does not appear to be trends by day of the week. 
+
+
+#Sugar Prices Controlling for inflation
+
+#write.csv(sugar_m, file="sugar_m.csv",row.names = FALSE)
+
+sugar_CPI <- read.csv("Sugar_cpi.csv")
+
+sugar_adj <- left_join(sugar_m, sugar_CPI, by = c("month" = "date"))
+
+sugar_adj$adj_price <- sugar_adj$mon_avg / sugar_adj$Value
+
+sugar_ts_adj <- ts(sugar_adj$adj_price, start = c(1993), frequency = 12)
+
+
+ggplot(sugar, aes(date, price)) +
+  geom_line() +
+  labs(title = "Sugar Prices") + xlab("year") + ylab("prices")
+
+ chartSeries(sugar_ts)
+
+ggplot(data = sugar_adj, aes(x = month, y = adj_price, group = 1)) +
+  geom_line() +
+  labs(x = "Month", y = "Adjusted Sugar Price", title = "Sugar Prices Adjusted for Inflation")
+
+ggplot(sugar_adj, aes(x = month)) +
+  geom_line(aes(y = Value, color = "Inflation Rate", group = 1)) +
+  geom_line(aes(y = mon_avg, color = "Sugar Price", group = 1)) +
+  scale_color_manual(values = c("blue", "red")) +
+  xlab("Month") +
+  ylab("Value") +
+  ggtitle("Inflation Rate and Sugar Prices over Time")
+
+
+
+sugar_adj$norm_value <- scale(sugar_adj$Value)
+sugar_adj$norm_mon_avg <- scale(sugar_adj$mon_avg)
+
+# Calculate the adjusted sugar price by dividing the monthly average sugar price by the CPI value
+
+
+# Plot the normalized values for 'Value' and 'mon_avg' and the adjusted sugar price as lines
+
+#changing month to a date
+sugar_adj$month <- as.Date(paste0(sugar_adj$month, "-01"))
+
+ggplot(sugar_adj, aes(x = month)) +
+  geom_line(aes(y = norm_value, color = "CPI", group = 1)) +
+  geom_line(aes(y = norm_mon_avg, color = "Sugar Price", group = 1)) +
+  scale_color_manual(values = c("darkblue", "orange")) +
+  xlab("Date") +
+  ylab("Normalized Values") +
+  ggtitle("Inflation Rate vs. Price - Sugar") +
+  scale_x_date(date_labels = "%Y")
+
+#Seasonal Plots
+#Format back to date in aggregated month column
+sugar_m %>%
+  mutate(month = ym(month)) -> Sugar_mon
+
+#Convert to tibble
+Sugar_mon <- as_tibble(Sugar_mon)
+
+#convert data frame into time series tsibble object
+Sugar_mon %>% as_tsibble(index = month) -> Sugar_mon_ts
+
+#Format data for Sugar seasonal plots
+Sugar_mon_ts %>%
+  mutate(Month = tsibble::yearmonth(month)) %>%
+  as_tsibble(index = Month) %>%
+  dplyr::select(Month,mon_avg) -> Sugar_sea_ts
+
+#Sugar seasonal plot by month
+autoplot(Sugar_sea_ts, mon_avg) +
+  ylab("monthly Sugar prices") +
+  xlab("")
+
+#Different view Sugar seasonal plot
+Sugar_sea_ts %>% gg_season(mon_avg, labels = "both") + 
+  ylab("Monthly Sugar prices")
+
+#Sugar seasonal subseries plot 
+Sugar_sea_ts %>% gg_subseries(mon_avg) +
+  labs(y = "Sugar prices", title = "Seasonal subseries plot: Sugar prices")
+```
+
+# Arima Sugar
+```{r}
+##Stationary Test
+adf.test(sugar_ts, alternative = "stationary")
+
+## After first-order differencing
+adf.test(diff(sugar_ts), alternative ="stationary")
+#This decreases our p-value and creates significance
+#Data is now stationary making the value of (d)=1
+
+#Custom ARIMA Model
+
+#Correlation Plot and Tuning selection. This plot looks at price correlation with itself in prior time periods. The parameter selection controls for that. 
+#ACF (q)
+acf(diff(sugar_ts),main='')
+#q=2
+
+#Looking at impact of price prior periods have on consecutive time periods
+#PACF (p)
+pacf(diff(sugar_ts),main='')
+#p=2. There are 2 partial auto corelation values
+
+# ARIMA Custom
+
+sugar_fit<- Arima(sugar_ts, order=c(2,1,2))
+
+BIC(sugar_fit)
+# Calculate the AICc value
+
+loglik_sugar_fit <- logLik(sugar_fit)
+
+loglik_sugar_fit <- logLik(sugar_fit) - max(loglik_sugar_fit)
+
+n <- length(sugar_ts)
+k <- length(coef(sugar_fit))
+sugar_fit_AICc <- AIC(sugar_fit) + 2*k*(k+1)/(n-k-1) - 2*loglik_sugar_fit
+
+sugar_fit_AICc
+
+sugar_fit
+
+# ARIMA Alternate Custom
+
+sugar_fit2<- Arima(sugar_ts, order=c(2,1,3))
+sugar_fit2
+
+forecast::accuracy(sugar_fit2)
+
+#Check residuals
+
+checkresiduals(sugar_fit2)
+
+#Auto-fit Arima
+
+auto_sugar<- auto.arima(sugar_ts)
+auto_sugar
+
+##Forecast Plot
+
+##Forecast Custom
+
+autoplot(forecast::forecast(sugar_fit, h=12, level=c(80,95)))
+
+##Forecast Custom 2
+
+autoplot(forecast::forecast(sugar_fit2, h=12, level=c(80,95)))
+
+##Forecast Auto
+
+autoplot(forecast::forecast(auto_sugar, h=12, level=c(80,95)))
+
+
+#ARIMA using more recent data
+
+sugar_r2 <- sugar %>%
+filter(date >= as.Date('2019-01-01') & date <= as.Date('2023-01-31'))
+
+sugar_r2 <- sugar_r2 %>% group_by(month) %>% mutate(mon_avg = mean(price))%>%
+select(month, mon_avg)
+
+#Drop Duplicate rows Sugar
+
+sugar_r2 <- sugar_r2[!duplicated(sugar_r2),]
+
+sugar_tsr <- ts(sugar_r2$mon_avg,start=c(2019),frequency=12)
+
+##Stationary Test
+adf.test(sugar_tsr, alternative = "stationary")
+
+## After first-order differencing
+adf.test(diff(sugar_tsr), alternative ="stationary")
+#This decreases our p-value and creates significance
+#Data is now stationary making the value of (d)=2
+
+#Custom Arima Model
+
+#Correlation Plot and Tuning selection
+#ACF (q)
+acf(diff(sugar_tsr),main='')
+#q=0
+
+#Looking at impact of price prior periods have on consecutive time periods
+#PACF (p)
+pacf(diff(sugar_tsr),main='')
+#p=0. There are 2 partial auto corelation values
+
+# ARIMA Custom
+
+sugar_fitR<- Arima(sugar_tsr, order=c(0,2,0))
+sugar_fitR
+
+forecast::accuracy(sugar_fitR)
+
+#Check residuals
+
+checkresiduals(sugar_fitR)
+
+#Auto-fit Arima
+
+auto_sugarR<- auto.arima(sugar_tsr)
+auto_sugarR
+
+##Forecast Plot
+
+autoplot(forecast::forecast(auto_sugarR, h=12, level=c(80,95)))
+
+##Forecast Custom
+
+autoplot(forecast::forecast(sugar_fitR, h=12, level=c(80,95)))
+
+#Printing Predictions
+
+sugar_predictions <- forecast::forecast(auto_sugarR,h=12)
+
+print(sugar_predictions$mean)
+```
+# Sugar GARCH
+```{r}
+
+# Model Creation
+
+garch_model <- ugarchspec(variance.model = list(model = "sGARCH", 
+                                                garchOrder = c(1,1)), 
+                                                mean.model = list(armaOrder =
+                                                c(0,0), include.mean = TRUE), distribution.model = "std")
+# Fitting Model to Data
+
+sugar_garch <- ugarchfit(spec = garch_model, data = sugar_ts)
+
+sugar_vol <-ts(sugar_garch@fit$sigma^2,start=c(1993),frequency=12)
+
+
+print(sugar_garch)
+
+#plot(sugar_garch, which = 1)
+
+coef(sugar_garch)
+
+# Forecasting
+
+horizon <- 3
+
+sugar_forecast_garch <- ugarchforecast(sugar_garch, n.ahead = horizon)
+
+forecast_mean_sugar <- as.numeric(sugar_forecast_garch@forecast$seriesFor)
+actual_values_sugar <- as.numeric(window(sugar_vol, start = c(1993, 1)))
+
+
+plot(sugar_forecast_garch, n.plot = horizon, n.col = 1, plot.type = "single", 
+     main = "GARCH Forecast for Sugar Prices", ylab = "Price", xlab = "Time") #%>%
+lines(sugar_ts[(length(sugar_ts)-horizon+1):length(sugar_ts)], col = "blue")
+
+
+#GARCH Take 2
+#Use ARIMA values from acf, pacf. Did this in Sugar_fit
+sugar_fit
+sugar_fit2
+sugar_fitR
+auto_sugar
+auto_sugarR
+
+#Based on significance. Let's try auto_arimas
+
+garch_model2 <- ugarchspec(variance.model = list(model = "sGARCH", 
+                                                garchOrder = c(1,1)), 
+                                                mean.model = list(armaOrder =
+                                                c(1,0), include.mean = TRUE), distribution.model = "std")
+
+sugar_garch2 <- ugarchfit(spec = garch_model, data = sugar_ts)
+sugar_garch2
+
+#Time Series based on volatility or Variance based on a standard Garch [1,1] model
+
+sugar_vol <-ts(sugar_garch2@fit$sigma^2,start=c(1993),frequency=12)
+
+plot(sugar_vol,xlab="",ylab="",main="Sugar_Volatility (GARCH[1,1])")
+
+#Exponential GARCH (does not work quite as well)
+Egarch_model <- ugarchspec(variance.model = list(model = "eGARCH", 
+                                                garchOrder = c(1,1)), 
+                                                mean.model = list(armaOrder =
+                                                c(1,0), include.mean = TRUE), distribution.model = "std")
+
+sugar_egarch2 <- ugarchfit(spec = garch_model, data = sugar_ts)
+sugar_egarch2
+coef(sugar_egarch2)
+
+sugar_forecast_garche <- ugarchforecast(sugar_egarch2, n.ahead = horizon)
+
+forecast_mean_sugare <- as.numeric(sugar_forecast_garche@forecast$seriesFor)
+actual_values_sugare <- as.numeric(window(sugar_vol, start = c(1993, 1)))
+
+#Time Series based on volatility or Variance based on a standard Garch [1,1] model
+
+esugar_vol <-ts(sugar_egarch2@fit$sigma^2,start=c(1993),frequency=12)
+
+#plot(esugar_vol,xlab="",ylab="",main="Sugar_Volatility (eGARCH[1,1])")
+
+cor(sugar_vol, esugar_vol)
+
+ts.plot(sugar_vol,esugar_vol,col=c("green","red"),xlab="")
+legend("topright",legend=c("Standard","Exponential"),col=c("green","red"),lty=c(1,1))
+#No difference shown
+
+#GARCH 3
+
+names(sugar_garch2@model)
+names(sugar_garch2@fit)
+#Variance
+sugar_garch_var <- sugar_garch2@fit$var
+#Residuals
+sugar_garch_res <- (sugar_garch2@fit$residuals)^2
+
+#Plotting residuals and conditional variances
+plot(sugar_garch_res, type = "l")
+lines(sugar_garch_var, col = "green")
+
+sugar_forecast_garch2 <- ugarchforecast(sugar_garch2, n.ahead = 12)
+sugar_forecast_garch2
+
+sugar_forecast_values <- as.numeric(sugar_forecast_garch2@forecast$series)
+print(sugar_forecast_values)
+sugar_forecast_index <- sugar_forecast_garch2@forecast$seriesFor
+sugar_forecast <- data.frame(time = sugar_forecast_index, forecast = sugar_forecast_values)
+print(sugar_forecast)
+#write.csv(sugar_forecast, file="sugar_forecast.csv",row.names = FALSE)
+
+sugar_garch2_fitted <- fitted(sugar_garch2)
+#print(sugar_garch2_fitted)
+
+
+#print(sugar_forecast_values)
+
+#summary(sugar_forecast_garch2)
+
+ug_sugar <- sugar_forecast_garch2@forecast$sigmaFor
+plot(ug_sugar, type = "l")
+
+sug_var_t <- c(tail(sugar_garch_var,20),rep(NA,10))  # gets the last 20 observations
+sug_res_t <- c(tail(sugar_garch_res,20),rep(NA,10))  # gets the last 20 observations
+sug_f <- c(rep(NA,20),(ug_sugar)^2)
+
+plot(sug_res_t, type = "l") #Residuals
+lines(sug_f, col = "orange") # Predictions 
+lines(sug_var_t, col = "green") #Conditional Forecast
+
+
+#Plot Predictions
+
+sug_mean_forecast <- as.numeric(sugar_forecast_garch2@forecast$seriesFor)
+
+# Get the upper and lower confidence intervals for both 95% and 80%
+sug_conf_int_95 <- as.numeric(sugar_forecast_garch2@forecast$upper[, "95%"]) # 95% confidence interval
+sug_conf_int_80 <- as.numeric(sugar_forecast_garch2@forecast$upper[, "80%"]) # 80% confidence interval
+
+# Plot the mean forecasted values with the two confidence intervals
+
+#plot(sugar_forecast_garch2, main = "Forecasted coffee Prices (GARCH(1,1))")
+
+
+```
+
+# Sugar Model Comparison
+```{r}
+
+#ARIMA Models
+forecast::accuracy(sugar_fit)
+forecast::accuracy(sugar_fit2)
+forecast::accuracy(auto_sugar)
+forecast::accuracy(sugar_fitR)
+forecast::accuracy(auto_sugarR)
+
+AIC(sugar_fit2)
+BIC(sugar_fit2)
+
+#GARCH Model
+
+actual_values_sugar <- as.numeric(window(sugar_ts))
+actual_values_sugar <- head(actual_values_sugar, length(forecast_mean_sugar))
+
+mae <- mean(abs(forecast_mean_sugar - actual_values_sugar))
+mse <- mean((forecast_mean_sugar - actual_values_sugar)^2)
+rmse <- sqrt(mse)
+# Print the results
+cat(paste("MAE: ", mae, "\n"))
+cat(paste("MSE: ", mse, "\n"))
+cat(paste("RMSE: ", rmse, "\n"))
+
+#GARCH Model 2
+
+forecast_mean_sugar2 <- as.numeric(sugar_forecast_garch2@forecast$seriesFor)
+actual_values_sugar2 <- as.numeric(window(sugar_ts))
+actual_values_sugar2 <- head(actual_values_sugar2, length(forecast_mean_sugar2))
+
+
+sug_mae <- mean(abs(forecast_mean_sugar2 - actual_values_sugar2))
+sug_mse <- mean((forecast_mean_sugar2 - actual_values_sugar2)^2)
+sug_rmse <- sqrt(sug_mse)
+# Print the results
+cat(paste("MAE: ", sug_mae, "\n"))
+cat(paste("MSE: ", sug_mse, "\n"))
+cat(paste("RMSE: ", sug_rmse, "\n"))
+
+
+#eGARCH
+
+forecast_mean_sugare <- as.numeric(sugar_forecast_garche@forecast$seriesFor)
+actual_values_sugare <- as.numeric(window(sugar_ts))
+actual_values_sugare <- head(actual_values_sugar2, length(forecast_mean_sugare))
+
+
+esug_mae <- mean(abs(forecast_mean_sugare - actual_values_sugare))
+esug_mse <- mean((forecast_mean_sugare - actual_values_sugare)^2)
+esug_rmse <- sqrt(sug_mse)
+# Print the results
+cat(paste("MAE: ", esug_mae, "\n"))
+cat(paste("MSE: ", esug_mse, "\n"))
+cat(paste("RMSE: ", esug_rmse, "\n"))
